@@ -20,9 +20,9 @@ pytz = "^2024.1"
 openpyxl = "^3.1.5"
 
 [tool.poetry.group.dev.dependencies]
-pytest = "^8.4.1"
+pytest = ">=8.4.1,<10.0.0"
 pytest-mock = "^3.14.1"
-setuptools = "^80.1.0"
+setuptools = ">=80.1,<84.0"
 
 [tool.poetry.scripts]
 delete_hidden_files = 'repair_tools.delete_hidden_files:main'
