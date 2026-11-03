@@ -21,9 +21,10 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument(
             "--directory",
-            type=list_of_paths,
+            type=Path,
             dest="directory",
             action=ExtendUnique,
+            nargs='+',
             help="path to a directory of packages",
         )
     return parser.parse_args()

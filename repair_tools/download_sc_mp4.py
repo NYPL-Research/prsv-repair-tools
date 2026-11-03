@@ -1,6 +1,5 @@
 import argparse
 from repair_tools.utils.format_utils import print_standard_summary
-from repair_tools.utils.cli import extant_dir
 import logging
 import os
 import re
@@ -8,6 +7,7 @@ import boto3
 import datetime
 import json
 import shutil
+from contextlib import redirect_stdout, redirect_stderr
 import subprocess
 from pathlib import Path
 from multiprocessing import Pool
@@ -16,6 +16,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import repair_tools.ami_scripts_imports.video_processing as vp
 import repair_tools.ami_scripts_imports.audio_to_mp4_converter as amp4
 import repair_tools.utils.aws_utils as aws_utils
+import repair_tools.verify_transcode as vt
+from repair_tools.utils.file_utils import find_package_files
+from repair_tools.rename_sc import fix_service_copy_names
 
 from repair_tools.utils.logger_setup import setup_logging
 
@@ -27,13 +30,15 @@ def parse_args():
     parser.add_argument(
         "--package",
         "-p",
-        type=extant_dir,
+        type=Path,
+        nargs='+',
         help="Path to the AMI package missing service copies"
     )
     parser.add_argument(
         "--directory",
         "-d",
-        type=extant_dir,
+        type=Path,
+        nargs='+',
         help="Path to directory of AMI packages missing service copies"
     )
     parser.add_argument(
@@ -78,6 +83,11 @@ def parse_args():
         action="store_true",
         help="Force local transcoding. Do not check S3."
     )
+    parser.add_argument(
+        "--fix-sympath",
+        action="store_true",
+        help="Modify symlink target paths starting with /source/repo/ to start with /Volumes/repo/ instead."
+    )
 
     return parser.parse_args()
 
@@ -96,53 +106,22 @@ def json_datetime_serializer(obj):
 
 ################# 
 
-def find_pm_files(pkg_dir: Path) -> list[Path]:
-    pm_dir = pkg_dir / 'data' / 'PreservationMasters'
-    if not pm_dir.exists():
-        return []
-    
-    valid_exts = {'.mkv', '.mov', '.dv', '.flac', '.wav', '.iso'}
-    return [p for p in pm_dir.rglob('*') if p.suffix.lower() in valid_exts and not p.name.startswith('._')]
-
-def get_media_duration(file_path: Path) -> float:
-    """Uses ffprobe to extract duration of a media file."""
-    cmd = [
-        'ffprobe', '-v', 'error',
-        '-show_entries', 'format=duration',
-        '-of', 'default=noprint_wrappers=1:nokey=1',
-        str(file_path)
-    ]
+def resolve_path(path: Path, modify_path: bool = False) -> Path:
+    """Resolves symlinks and optionally replaces /source/repo/ with /Volumes/repo/."""
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        return float(result.stdout.strip())
-    except Exception as e:
-        logging.error(f"Failed to get duration for {file_path.name}: {e}")
-        return -1.0
+        resolved = path.resolve()
+    except Exception:
+        resolved = path
 
-def verify_transcode_success(pm_path: Path, sc_path: Path) -> bool:
-    """Confirms the output file is not empty and matches duration of the source file."""
-    if not sc_path.exists() or sc_path.stat().st_size == 0:
-        logging.error(f"Verification failed: {sc_path.name} does not exist or is empty.")
-        return False
-        
-    pm_duration = get_media_duration(pm_path)
-    sc_duration = get_media_duration(sc_path)
-    
-    if pm_duration < 0 or sc_duration < 0:
-        logging.error(f"Verification failed: Could not retrieve duration for {pm_path.name} or {sc_path.name}.")
-        return False
-        
-    # Duration comparison within a 0.5s margin to account for container differences
-    duration_diff = abs(pm_duration - sc_duration)
-    if duration_diff > 0.5:
-        logging.error(f"Verification failed: Duration mismatch for {sc_path.name}. PM: {pm_duration}s, SC: {sc_duration}s (diff: {duration_diff}s)")
-        return False
-        
-    logging.info(f"Verification successful for {sc_path.name}. Duration diff: {duration_diff:.3f}s")
-    return True
+    if modify_path:
+        resolved_str = str(resolved)
+        if resolved_str.startswith("/source/repo/"): # hard coded for now specifically for ICA/lpa/0_symbags
+            resolved_str = resolved_str.replace("/source/repo/", "/Volumes/repo/", 1)
+            return Path(resolved_str)
+    return resolved
 
 def create_sc_worker(task):
-    pkg_path, files_to_process = task
+    pkg_path, files_to_process, fix_sympath = task
     errors = []
     successful_files = []
     
@@ -159,41 +138,71 @@ def create_sc_worker(task):
 
         for file in files_to_process:
             file_path = Path(file)
-            print(f"Starting transcode worker for {file_path.name}")
+            resolved_file_path = resolve_path(file_path, fix_sympath)
+            print(f"Starting transcode worker for {resolved_file_path.name}")
             
-            sc_name = file_path.stem.replace('_pm', '_sc') + ".mp4"
-            em_name = file_path.stem.replace('_pm', '_em') + ".mp4"
+            # strip role (_pm / _em) from the stem
+            base_stem = re.sub(r'_(pm|em)$', '', file_path.stem)
+            sc_name = f"{base_stem}_sc.mp4"
+            em_name = f"{base_stem}_em.mp4"
             
             if (sc_dir / sc_name).exists():
                 successful_files.append(sc_name)
                 print(f"Service copy already exists: {sc_name}")
                 continue
             if (sc_dir / em_name).exists():
-                successful_files.append(em_name) 
-                print(f"Service copy already exists: {em_name}")
-                continue
+                em_path = sc_dir / em_name
+                target_sc = sc_dir / sc_name
+                try:
+                    em_path.rename(target_sc)
+                    successful_files.append(sc_name)
+                    print(f"Service copy already exists, renamed: {em_name} -> {sc_name}")
+                    continue
+                except Exception as e:
+                    logging.error(f"Failed to rename existing {em_name} to {sc_name}: {e}")
 
             try:
-                if file_path.suffix.lower() in {'.wav', '.flac'}:
-                    target_sc_path = sc_dir / sc_name
-                    amp4.convert_audio(str(file_path), "mp4", output_file=str(target_sc_path))
-                else:
-                    vp.convert_to_mp4(file_path.resolve(), file_path.name, sc_dir, audio_pan="auto")
+                devnull_fd = os.open(os.devnull, os.O_WRONLY)
+                
+                saved_stdout_fd = os.dup(1)
+                saved_stderr_fd = os.dup(2)
+                
+                try:
+                    os.dup2(devnull_fd, 1)
+                    os.dup2(devnull_fd, 2)
+                    
+                    if file_path.suffix.lower() in {'.wav', '.flac'}:
+                        target_sc_path = sc_dir / sc_name
+                        amp4.convert_audio(str(resolved_file_path), "mp4", output_file=str(target_sc_path))
+                    else:
+                        vp.convert_to_mp4(resolved_file_path, file_path.name, sc_dir, audio_pan="auto")
+                        
+                finally:
+                    os.dup2(saved_stdout_fd, 1)
+                    os.dup2(saved_stderr_fd, 2)
+                    
+                    os.close(saved_stdout_fd)
+                    os.close(saved_stderr_fd)
+                    os.close(devnull_fd)
                 
                 created_path = None
                 if (sc_dir / sc_name).exists():
                     created_path = sc_dir / sc_name
                 elif (sc_dir / em_name).exists():
-                    created_path = sc_dir / em_name
-                elif (sc_dir / file_path.with_suffix('.mp4').name).exists():
-                    created_path = sc_dir / file_path.with_suffix('.mp4').name
                     try:
-                        created_path = created_path.rename(sc_dir / sc_name)
+                        created_path = (sc_dir / em_name).rename(sc_dir / sc_name)
                     except Exception as e:
-                        logging.error(f"Failed to rename created file {created_path} to {sc_name}: {e}")
-                        created_path = sc_dir / sc_name
+                        logging.error(f"Failed to rename created file {em_name} to {sc_name}: {e}")
+                        created_path = sc_dir / em_name
+                elif (sc_dir / file_path.with_suffix('.mp4').name).exists():
+                    raw_output = sc_dir / file_path.with_suffix('.mp4').name
+                    try:
+                        created_path = raw_output.rename(sc_dir / sc_name)
+                    except Exception as e:
+                        logging.error(f"Failed to rename created file {raw_output} to {sc_name}: {e}")
+                        created_path = raw_output
 
-                if created_path and verify_transcode_success(file_path, created_path):
+                if created_path and vt.verify_transcode_success(resolved_file_path, created_path, margin=0.5):
                     successful_files.append(created_path.name)
                     print(f"Successfully created and verified service copy: {created_path.name}")
                 else:
@@ -247,20 +256,20 @@ def build_s3_index(bucket_name, index_path):
     return index_map
     
 def download_file_worker(task):
-    bucket, key, dest, pkg_path, pm_filename, test_mode = task
+    bucket, key, dest, pkg_path, pm_file_path, test_mode, fix_sympath = task
     
     if dest.exists():
-        return pkg_path, pm_filename, f"Skipped (SC Exists): {dest.name}", True
+        return pkg_path, pm_file_path, f"Skipped (SC Exists): {dest.name}", True
 
     if test_mode:
-        return pkg_path, pm_filename, f"[TEST] Would download {key} to {dest}", True
+        return pkg_path, pm_file_path, f"[TEST] Would download {key} to {dest}", True
 
     try:
         try:
             dest.parent.mkdir(parents=True, exist_ok=True)
         except Exception as e:
             logging.warning(f"Failed to create SC directory {dest.parent}: {e}")
-            return pkg_path, pm_filename, f"Failed to create directory for {dest.parent}: {e}", False
+            return pkg_path, pm_file_path, f"Failed to create directory for {dest.parent}: {e}", False
         try:
             dest.parent.chmod(0o777)
         except Exception as e:
@@ -269,21 +278,20 @@ def download_file_worker(task):
         s3 = boto3.client('s3')
         s3.download_file(bucket, key, str(dest))
         
-        pm_path = pkg_path / 'data' / 'PreservationMasters' / pm_filename
-        if not pm_path.exists():
-            pm_path = pkg_path / 'data' / 'EditMasters' / pm_filename
+        resolved_pm_path = resolve_path(pm_file_path, fix_sympath)
             
-        if pm_path.exists():
-            if not verify_transcode_success(pm_path, dest):
+        if resolved_pm_path.exists():
+            if not vt.verify_transcode_success(resolved_pm_path, dest, margin=0.5):
                 if dest.exists():
                     dest.unlink()
-                return pkg_path, pm_filename, f"Error: Downloaded file {dest.name} failed duration/validity verification", False
+                return pkg_path, pm_file_path, f"Error: Downloaded file {dest.name} failed duration/validity verification", False
         else:
-            logging.warning(f"Could not find local source file to verify download duration for {dest.name}")
+            logging.warning(f"Could not find local source file: {dest.name}")
+            return pkg_path, pm_file_path, f"Error: Local source file {dest.name} not found", False
             
-        return pkg_path, pm_filename, f"{key} found in bucket, downloaded, and verified: {dest.name}", True
+        return pkg_path, pm_file_path, f"{key} found in bucket, downloaded, and verified: {dest.name}", True
     except Exception as e:
-        return pkg_path, pm_filename, f"Error downloading {key}: {e}", False
+        return pkg_path, pm_file_path, f"Error downloading {key}: {e}", False
 
 def print_summary(stats, package_status):
     total_sc_secured = stats["dl_success"] + stats["tc_success"]
@@ -327,17 +335,56 @@ def main():
     setup_logging(args.logpath / f"download_sc_{datetime.datetime.now():%Y%m%d}.log", noisy_loggers=['repair_tools', 'ffmpeg'])
 
     pkg_paths = []
+    dir_pattern = re.compile(r"^\d{6}$")
+
     if args.package:
-        pkg_paths.append(Path(args.package))
-    else: 
-        dir_pattern = re.compile(r"^\d{6}$")
-        pkg_paths = [d for d in Path(args.directory).iterdir() if d.is_dir() and dir_pattern.match(d.name)]
+        for pkg in args.package:
+            resolved_package = resolve_path(pkg, args.fix_sympath)
+            if not resolved_package.is_dir():
+                logging.error(f"Package directory not found: {resolved_package}")
+                continue
+            
+            # skip empty package directories
+            if not any(resolved_package.iterdir()):
+                logging.warning(f"Skipping empty package directory: {resolved_package}")
+                continue
+                
+            pkg_paths.append(resolved_package)
+            
+    elif args.directory:
+        for d in args.directory:
+            resolved_directory = resolve_path(d, args.fix_sympath)
+            if not resolved_directory.is_dir():
+                logging.error(f"Directory not found: {resolved_directory}")
+                continue
+            
+            # skip empty parent directories
+            if not any(resolved_directory.iterdir()):
+                logging.warning(f"Skipping empty directory: {resolved_directory}")
+                continue
+            
+            if dir_pattern.match(resolved_directory.name):
+                pkg_paths.append(resolved_directory)
+            else:
+                pkg_paths.extend([
+                    resolve_path(sub_d, args.fix_sympath) 
+                    for sub_d in resolved_directory.iterdir() 
+                    if sub_d.is_dir() and dir_pattern.match(sub_d.name) and any(sub_d.iterdir())
+                ])
+
+    else:
+        logging.error("Either --package or --directory must be specified.")
+        return
 
     if not pkg_paths:
         logging.warning("No package directories found.")
         return
 
     logging.info(f"Found {len(pkg_paths)} package(s) to process.")
+
+    logging.info("Checking for misplaced '_em.mp4' files in ServiceCopies...")
+    for pkg in pkg_paths:
+        fix_service_copy_names(pkg, test_mode=args.test)
 
     s3_lookup = {}
     use_s3 = (args.bucket and args.profile) and not args.transcode_only
@@ -371,7 +418,19 @@ def main():
     transcode_map = {} 
 
     for pkg in pkg_paths:
-        pm_files = find_pm_files(pkg)
+        em_folder = Path(pkg / "data" / "EditMasters")
+        if em_folder.exists():
+            pm_files = find_package_files(
+                pkg, 
+                folders=['EditMasters'], 
+                valid_exts={'.mkv', '.mov', '.dv', '.flac', '.wav', '.iso'}
+            )
+        else:
+            pm_files = find_package_files(
+                pkg, 
+                folders=['PreservationMasters'], 
+                valid_exts={'.mkv', '.mov', '.dv', '.flac', '.wav', '.iso'}
+            )
         stats['pm_found'] += len(pm_files)
 
         if not pm_files:
@@ -386,9 +445,10 @@ def main():
             found_key = None
         
             if use_s3 and not args.transcode_only:
+                base_stem = re.sub(r'_(pm|em)$', '', pm_file.stem)
                 candidates = [
-                    pm_file.stem.replace('_pm', '_sc') + ".mp4",
-                    pm_file.stem.replace('_pm', '_em').replace('_sc', '_em') + ".mp4"
+                    f"{base_stem}_sc.mp4",
+                    f"{base_stem}_em.mp4"
                 ]
                 
                 for cand in candidates:
@@ -397,8 +457,9 @@ def main():
                         break
                 
             if found_key and not args.transcode_only:
-                    dest = sc_dir / Path(found_key).name
-                    download_tasks.append((args.bucket, found_key, dest, pkg, pm_file.name, args.test))
+                dest_name = re.sub(r'_(em|pm)\.mp4$', '_sc.mp4', Path(found_key).name, flags=re.IGNORECASE)
+                dest = sc_dir / dest_name
+                download_tasks.append((args.bucket, found_key, dest, pkg, pm_file, args.test, args.fix_sympath))
             elif not args.download_only:
                 if pm_file.suffix.lower() == '.iso':
                     package_status[pkg]['errors'].append(f"ISO transcoding is not supported: {pm_file.name}")
@@ -417,29 +478,37 @@ def main():
             futures = [executor.submit(download_file_worker, task) for task in download_tasks]
             
             for future in as_completed(futures):
-                pkg, pm_name, msg, success = future.result()
+                pkg, pm_file_path, msg, success = future.result()
                 if success:
                     logging.info(msg)
                     stats['dl_success'] += 1
-                    package_status[pkg]['secured_pms'].add(pm_name)
+                    package_status[pkg]['secured_pms'].add(pm_file_path.name)
                 else:
                     logging.error(msg)
                     stats['dl_fail'] += 1
                     package_status[pkg]['errors'].append(msg)
+                    if not args.download_only:
+                        if pm_file_path.suffix.lower() == '.iso':
+                            package_status[pkg]['errors'].append(f"ISO transcoding is not supported: {pm_file_path.name}")
+                        else:
+                            logging.info(f"Adding {pm_file_path.name} to transcode queue after failed download/validation.")
+                            if pkg not in transcode_map:
+                                transcode_map[pkg] = []
+                            transcode_map[pkg].append(pm_file_path)
 
-    transcode_tasks = [(pkg, files) for pkg, files in transcode_map.items()]
+    transcode_tasks = [(pkg, files, args.fix_sympath) for pkg, files in transcode_map.items()]
     
     if transcode_tasks:
-        total_files = sum(len(files) for _, files in transcode_tasks)
+        total_files = sum(len(files) for _, files, _ in transcode_tasks)
         
         if args.test:
             logging.info(f"[TEST MODE] Would transcode: {total_files} files for {len(transcode_tasks)} packages")
             stats['tc_success'] += total_files
-            for pkg, files in transcode_tasks:
+            for pkg, files, _ in transcode_tasks:
                 for f in files:
                     package_status[pkg]['secured_pms'].add(f.name)
         else:
-            logging.info(f"Starting transcode for {total_files} files for {len(transcode_tasks)} packages: [{' '.join(str(t[0].name) for t in transcode_tasks)}]")
+            logging.info(f"Starting transcode for {total_files} files for {len(transcode_tasks)} packages: [{' '.join(f.name for t in transcode_tasks for f in t[1])}]")
             with Pool(processes=NUM_CPU_THREADS) as pool:
                 results = pool.map(create_sc_worker, transcode_tasks)
 
@@ -451,8 +520,8 @@ def main():
                         matched = False
                         for expected_pm in package_status[pkg]['expected_pms']:
                             pm_stem = Path(expected_pm).stem
-                            base_sc = sc_stem.replace('_sc', '').replace('_em', '')
-                            base_pm = pm_stem.replace('_pm', '')
+                            base_sc = re.sub(r'_(sc|em)$', '', sc_stem)
+                            base_pm = re.sub(r'_(pm|em)$', '', pm_stem)
                             if base_sc == base_pm or base_sc.startswith(base_pm):
                                 package_status[pkg]['secured_pms'].add(expected_pm)
                                 matched = True
@@ -496,12 +565,16 @@ def main():
             logging.info(f"[TEST] Would move {len(successful_pkgs_to_move)} packages to {fixed_dir}")
             stats['moved'] = len(successful_pkgs_to_move)
 
-    # Identify and move any leftover packages containing ISO files to the _iso directory
+    # move any leftover packages containing ISO files _iso directory
     iso_packages_to_move = []
     for pkg in pkg_paths:
         if pkg in successful_pkgs_to_move:
             continue
-        pm_files = find_pm_files(pkg)
+        pm_files = find_package_files(
+            pkg, 
+            folders=['PreservationMasters'], 
+            valid_exts={'.mkv', '.mov', '.dv', '.flac', '.wav', '.iso'}
+        )
         if any(f.suffix.lower() == '.iso' for f in pm_files):
             iso_packages_to_move.append(pkg)
 
@@ -521,21 +594,29 @@ def main():
             logging.info(f"[TEST] Would move {len(iso_packages_to_move)} ISO packages to {iso_false_dir}")
             stats['moved'] += len(iso_packages_to_move)
 
-    source_dir = Path(args.directory) if args.directory else Path(args.package).parent
+    # source_dir = Path(args.directory) if args.directory else Path(args.package).parent
 
     print_summary(stats, package_status)
     
-    if source_dir.exists():
-        visible_files = [p for p in source_dir.iterdir() if not p.name.startswith('.')]
-        if not visible_files:
-            if args.test:
-                 logging.info(f"[TEST] Would remove empty source directory {source_dir.name}")
-            else:
-                try:
-                    shutil.rmtree(source_dir)
-                    logging.info("Empty source directory removed.")
-                except Exception as e:
-                    logging.error(f"Failed to remove empty source directory: {e}")
+    if args.directory:
+        source_dirs = set(resolve_path(d, args.fix_sympath).parent if dir_pattern.match(d.name) else resolve_path(d, args.fix_sympath) for d in args.directory)
+    elif args.package:
+        source_dirs = set(resolve_path(p, args.fix_sympath).parent for p in args.package)
+    else:
+        source_dirs = set()
+
+    for s_dir in source_dirs:
+        if s_dir.exists() and s_dir.is_dir():
+            visible_files = [p for p in s_dir.iterdir() if not p.name.startswith('.')]
+            if not visible_files:
+                if args.test:
+                     logging.info(f"[TEST] Would remove empty source directory {s_dir.name}")
+                else:
+                    try:
+                        shutil.rmtree(s_dir)
+                        logging.info(f"Empty source directory removed: {s_dir.name}")
+                    except Exception as e:
+                        logging.error(f"Failed to remove empty source directory {s_dir.name}: {e}")
                     
                 
 

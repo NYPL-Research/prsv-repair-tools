@@ -9,7 +9,6 @@ import concurrent.futures
 import xml.etree.ElementTree as ET
 from datetime import datetime
 
-from repair_tools.utils import prsv_api_helpers 
 from repair_tools.archive.create_pkg_report import requests_retry_session
 from repair_tools.utils.preservica_search_parse import PreservicaAPI
 from repair_tools.utils import prsv_api
@@ -68,9 +67,6 @@ def parse_args():
         )
     
     args = parser.parse_args()
-
-    if args.move and not args.deletion_parent:
-        parser.error("The --move argument requires --deletion-parent to be specified.")
 
     return args
 
@@ -282,8 +278,8 @@ def get_uuids_for_title(api: PreservicaAPI, pkg_title: str, parent_uuid: str, se
 
     return uuids
 
-def scan_parent_for_duplicates(api: PreservicaAPI, parent_uuid: str, prefix: str = None, session=None) -> dict:
-    logger.info(f"Scanning parent {parent_uuid}.")
+def scan_parent_for_duplicates(api: PreservicaAPI, parent_name: str, parent_uuid: str, prefix: str = None, session=None) -> dict:
+    logger.info(f"Scanning parent {parent_name}: {parent_uuid}.")
     
     title_map = {}
     
@@ -361,6 +357,91 @@ def normalize_filename(fname: str) -> str:
         return fname[:-4] + '.mp4'
     return fname
 
+def fetch_package_file_data(api: PreservicaAPI, pkg_uuid: str, session) -> dict:
+    """
+    Traverses a package to extract all bitstream filenames, sizes, and MD5 hashes.
+    Returns: { 'filename.ext': {'size': int, 'md5': 'hash'} }
+    """
+    file_data = {}
+    version = prsv_api.find_apiversion(api.credentials_name)
+    namespaces = {
+        'xip': f'http://preservica.com/XIP/v{version}',
+        'entity': f'http://preservica.com/EntityAPI/v{version}'
+    }
+
+    stack = [pkg_uuid]
+    io_refs = []
+
+    while stack:
+        current = stack.pop()
+        url = f"{api.ENTITY_URL}/structural-objects/{current}/children?max=1000"
+        try:
+            res = session.get(url, headers=api.headers, timeout=30)
+            if res.status_code == 401:
+                force_token_refresh(api)
+                res = session.get(url, headers=api.headers, timeout=30)
+            res.raise_for_status()
+            root = ET.fromstring(res.text)
+            for child in root.findall(".//entity:Children", namespaces):
+                c_type = child.get('type')
+                c_ref = child.get('ref')
+                if c_type == 'SO':
+                    stack.append(c_ref)
+                elif c_type == 'IO':
+                    io_refs.append(c_ref)
+        except Exception as e:
+            logger.error(f"Error getting children for SO {current}: {e}")
+
+    # 2. Iterate IOs -> Reps -> COs -> Bitstreams
+    for io_ref in io_refs:
+        rep_url = f"{api.ENTITY_URL}/information-objects/{io_ref}/representations"
+        try:
+            res = session.get(rep_url, headers=api.headers, timeout=30)
+            res.raise_for_status()
+            rep_root = ET.fromstring(res.text)
+
+            for rep in rep_root.findall('.//entity:Representation', namespaces):
+                rep_type = rep.get('type')
+                co_url = f"{api.ENTITY_URL}/information-objects/{io_ref}/representations/{rep_type}"
+                co_res = session.get(co_url, headers=api.headers, timeout=30)
+                co_root = ET.fromstring(co_res.text)
+
+                for co in co_root.findall('.//entity:ContentObjects/entity:ContentObject', namespaces):
+                    co_ref = co.get('ref') or co.text
+                    if not co_ref: continue
+                    co_ref = co_ref.strip()
+
+                    gen_url = f"{api.ENTITY_URL}/content-objects/{co_ref}/generations/latest-active"
+                    gen_res = session.get(gen_url, headers=api.headers, timeout=30)
+                    gen_root = ET.fromstring(gen_res.text)
+
+                    bitstream = gen_root.find('.//entity:Bitstream', namespaces)
+                    if bitstream is not None and bitstream.text:
+                        bit_url = bitstream.text
+                        bit_res = session.get(bit_url, headers=api.headers, timeout=30)
+                        bit_root = ET.fromstring(bit_res.text)
+
+                        fname_elem = bit_root.find('.//xip:Filename', namespaces)
+                        fsize_elem = bit_root.find('.//xip:FileSize', namespaces)
+
+                        fname = fname_elem.text if fname_elem is not None else None
+                        fsize = int(fsize_elem.text) if fsize_elem is not None and fsize_elem.text else 0
+
+                        md5_val = None
+                        for fixity in bit_root.findall('.//xip:Fixity', namespaces):
+                            alg = fixity.find('xip:FixityAlgorithmRef', namespaces)
+                            val = fixity.find('xip:FixityValue', namespaces)
+                            if alg is not None and val is not None and alg.text.upper() == 'MD5':
+                                md5_val = val.text.lower()
+                                break
+
+                        if fname:
+                            file_data[fname] = {'size': fsize, 'md5': md5_val}
+        except Exception as e:
+            logger.error(f"Error getting file details for IO {io_ref}: {e}")
+
+    return file_data
+
 def compare_duplicate_contents(api: PreservicaAPI, title: str, valid_items: list, session):
     logger.info(f"[{title}] Running detailed content comparison for {len(valid_items)} packages...")
     
@@ -370,7 +451,8 @@ def compare_duplicate_contents(api: PreservicaAPI, title: str, valid_items: list
     for item in valid_items:
         uuid = item['uuid']
         logger.info(f"Getting objects for UUID: {uuid} (Ingested: {item['date_str']})")
-        contents = prsv_api_helpers.get_preservica_objects(api, uuid, session)
+        # Swap out the imported function call for our new reliable local function
+        contents = fetch_package_file_data(api, uuid, session)
         uuid_contents[uuid] = contents
         for fname in contents.keys():
             normalized_all.add(normalize_filename(fname))
@@ -472,7 +554,7 @@ def compare_duplicate_contents(api: PreservicaAPI, title: str, valid_items: list
     
     return "RESOLVABLE", keep_item, remove_items
 
-def resolve_duplicate_uuids(api: PreservicaAPI, title: str, uuids: list, deletion_uuid: str, move_duplicate: bool, compare: bool, session) -> dict:
+def resolve_duplicate_uuids(api: PreservicaAPI, title: str, uuids: list, deletion_name: str, deletion_uuid: str, move_duplicate: bool, compare: bool, session) -> dict:
     if len(uuids) < 2:
         return None
     
@@ -512,7 +594,7 @@ def resolve_duplicate_uuids(api: PreservicaAPI, title: str, uuids: list, deletio
             logger.info(f"KEEPING: {keep['uuid']} (Ingested: {keep['date_str']})")
             
             for item in remove:
-                logger.info(f"MOVING DUPLICATE: {item['uuid']} (Ingested: {item['date_str']}) -> {deletion_uuid}")
+                logger.info(f"MOVING DUPLICATE: {item['uuid']} (Ingested: {item['date_str']}) -> {deletion_name}: {deletion_uuid}")
                 success = api.move_entity(item['uuid'], deletion_uuid)
                 if success:
                     logger.info(f"Successfully moved {item['uuid']}")
@@ -528,7 +610,6 @@ def resolve_duplicate_uuids(api: PreservicaAPI, title: str, uuids: list, deletio
 def main():
     args = parse_args()
     
-    # Initialize our logger configuration function
     log_file = setup_logger(args.logpath)
 
     logger.info(f"Starting find_duplicates. All logs will be saved to: {log_file}")
@@ -536,16 +617,27 @@ def main():
     api = PreservicaAPI(args.credentials)
     session = requests_retry_session()
     
-    parent_uuid = api.ami_uuid if args.parent == "ami" else api.digarch_uuid
+    ami_uuid = ["AMI_PROD", "183a74b5-7247-4fb2-8184-959366bc0cbc"] if "test" not in args.credentials else ["AMI_DEV", "9a99c060-b6cf-4bb1-8385-27ff72c69c78"]
+    digarch_uuid = ["DIGARCH_PROD", "e80315bc-42f5-44da-807f-446f78621c08"] if "test" not in args.credentials else ["DIGARCH_DEV", ""]
+    default_deletion_uuid = ["DELETION_PROD", "836a114b-839a-4af8-a4e1-001f200d6d40"] if "test" not in args.credentials else ["DELETION_DEV", "d19043cb-b9ef-4ac4-a3f6-245f3eb99e6f"]
     
-    # { "RESOLVED": { title: { "keep": item, "remove": [items] } }, "REVIEW": { title: [items] } }
+    parent_name = ami_uuid[0] if args.parent == "ami" else digarch_uuid[0]
+    parent_uuid_val = ami_uuid[1] if args.parent == "ami" else digarch_uuid[1]
+    
+    if args.deletion_parent and args.deletion_parent != "deletion":
+        deletion_uuid_val = args.deletion_parent
+        deletion_name = "CUSTOM_DELETION"
+    else:
+        deletion_name = default_deletion_uuid[0]
+        deletion_uuid_val = default_deletion_uuid[1]
+
     summary_results = {"RESOLVED": {}, "REVIEW": {}}
     
     if args.package:
         logger.info(f"Checking package: {args.package}")
-        uuids = get_uuids_for_title(api, args.package, parent_uuid, session)
+        uuids = get_uuids_for_title(api, args.package, parent_uuid_val, session)
         if len(uuids) > 1:
-            res = resolve_duplicate_uuids(api, args.package, uuids, args.deletion_parent, args.move, args.compare, session)
+            res = resolve_duplicate_uuids(api, args.package, uuids, deletion_name, deletion_uuid_val, args.move, args.compare, session)
             if res:
                 if res["status"] == "REVIEW":
                     summary_results["REVIEW"][args.package] = res["items"]
@@ -555,7 +647,7 @@ def main():
             logger.info("No duplicates found.")
             
     else:
-        duplicates_map = scan_parent_for_duplicates(api, parent_uuid, args.prefix, session)
+        duplicates_map = scan_parent_for_duplicates(api, parent_name, parent_uuid_val, args.prefix, session)
         
         if not duplicates_map:
             logger.info("Scan complete. No duplicates found.")
@@ -564,7 +656,7 @@ def main():
             
             for title, uuids in duplicates_map.items():
                 try:
-                    res = resolve_duplicate_uuids(api, title, uuids, args.deletion_parent, args.move, args.compare, session)
+                    res = resolve_duplicate_uuids(api, title, uuids, deletion_name, deletion_uuid_val, args.move, args.compare, session)
                     if res:
                         if res["status"] == "REVIEW":
                             summary_results["REVIEW"][title] = res["items"]
