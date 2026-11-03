@@ -3,7 +3,7 @@ import json
 import xml.etree.ElementTree as ET
 import repair_tools.utils.prsv_api as prsvapi
 import repair_tools.utils.prsv_api_helpers as prsvapi_helpers
-import repair_tools.cli as prsvcli
+import repair_tools.utils.cli as prsvcli
 import logging
 import sys
 import pandas as pd

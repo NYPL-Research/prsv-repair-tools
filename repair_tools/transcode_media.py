@@ -9,6 +9,9 @@ from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 from repair_tools.utils.cli import Parser
+import filecmp
+from repair_tools.utils.file_utils import find_package_files
+import repair_tools.verify_transcode as vt
 
 # logging handler to play nice with tqdm
 class TqdmLoggingHandler(logging.Handler):
@@ -49,7 +52,7 @@ TRANSCODERS = {
 }
 
 def parse_args() -> argparse.Namespace:
-    parser = Parser(description='Transcode media files within AMI packages.')
+    parser = Parser()
     parser.add_package()
     parser.add_packagedirectory()
     parser.add_argument(
@@ -57,11 +60,17 @@ def parse_args() -> argparse.Namespace:
         choices=['wav', 'mov'],
         help='Optional. Restrict transcoding to a specific file type (wav or mov).'
     )
+
+    parser.add_argument(
+        '--all',
+        action='store_true',
+        help='Optional. Transcode files in both EditMasters and PreservationMasters.'
+    )
     
     return parser.parse_args()
 
 def parse_manifest(pkg_path: Path) -> dict:
-    """Reads standard bagit/AMI manifests into a dictionary mapping resolved paths to (algorithm, hash)."""
+    """Reads bag manifests into a dictionary mapping resolved paths to (algorithm, hash)."""
     manifest_data = {}
     for manifest_name in ['manifest-md5.txt']:
         manifest_path = pkg_path / manifest_name
@@ -80,7 +89,7 @@ def parse_manifest(pkg_path: Path) -> dict:
                 logger.error(f"Failed to read manifest {manifest_path.name}: {e}")
     return manifest_data
 
-def verify_file_checksum(file_path: Path, manifest_data: dict) -> bool:
+def verify_file_checksum(file_path: Path, manifest_data: dict) -> bool: # gemini written, double check
     """Hashes the file and compares it against the manifest data."""
     resolved_path = file_path.resolve()
     if resolved_path not in manifest_data:
@@ -90,7 +99,7 @@ def verify_file_checksum(file_path: Path, manifest_data: dict) -> bool:
     algo, expected_hash = manifest_data[resolved_path]
     hasher = hashlib.md5() if algo == 'md5' else hashlib.sha256()
     
-    logger.info(f"Validating {algo.upper()} checksum for {file_path.name}...")
+    logger.info(f"Validating {algo.upper()} checksum for {file_path}...")
     try:
         with open(file_path, 'rb') as f:
             for chunk in iter(lambda: f.read(4096 * 1024), b""):
@@ -104,42 +113,6 @@ def verify_file_checksum(file_path: Path, manifest_data: dict) -> bool:
             return False
     except Exception as e:
         logger.error(f"Error reading file for checksum {file_path.name}: {e}")
-        return False
-
-def generate_framemd5(file_path: Path) -> Path:
-    """Generates a framemd5 file for a given media file using ffmpeg."""
-    out_fmd5 = file_path.with_suffix('.framemd5')
-    cmd = ['ffmpeg', '-v', 'error', '-y', '-i', str(file_path), '-f', 'framemd5', str(out_fmd5)]
-    try:
-        subprocess.run(cmd, check=True, capture_output=True, text=True)
-        return out_fmd5
-    except subprocess.CalledProcessError as e:
-        logger.error(f"Failed to generate framemd5 for {file_path.name}: {e.stderr}")
-        if out_fmd5.exists():
-            out_fmd5.unlink()
-        return None
-
-def compare_framemd5(fmd5_1: Path, fmd5_2: Path) -> bool:
-    """Compares the payload hashes of two framemd5 files, ignoring header lines."""
-    def extract_hashes(fmd5_path: Path) -> list[str]:
-        hashes = []
-        with open(fmd5_path, 'r', encoding='utf-8') as f:
-            for line in f:
-                if not line.startswith('#'):
-                    hashes.append(line.strip())
-        return hashes
-        
-    try:
-        hashes1 = extract_hashes(fmd5_1)
-        hashes2 = extract_hashes(fmd5_2)
-        
-        if not hashes1 or not hashes2:
-            logger.error("One or both framemd5 files are empty or unreadable.")
-            return False
-            
-        return hashes1 == hashes2
-    except Exception as e:
-        logger.error(f"Error reading framemd5 files during comparison: {e}")
         return False
 
 def transcode_single_file(input_file: Path, output_file: Path, config: dict) -> bool:
@@ -166,56 +139,53 @@ def transcode_single_file(input_file: Path, output_file: Path, config: dict) -> 
         logger.error(f"Transcoding failed for {input_file.name}: {e.stderr}")
         return False
 
-def find_files(pkg_path: Path, config: dict) -> list[Path]:
-    files = []
+def verify_lossless(input_file: Path, output_file: Path) -> bool:
+    """Verifies lossless integrity between source and output using framemd5."""
+    logger.info(f"Validating lossless integrity for {output_file.name}...")
     
-    pm_dir = pkg_path / 'data' / 'PreservationMasters'
-    em_dir = pkg_path / 'data' / 'EditMasters'
+    src_fmd5 = vt.generate_framemd5(input_file)
+    dst_fmd5 = vt.generate_framemd5(output_file)
     
-    for main_dir in [pm_dir, em_dir]:
-        if main_dir.exists() and main_dir.is_dir():
-            pattern = config['find_pattern']
-            files.extend([f for f in main_dir.rglob(pattern) if not f.name.startswith("._")])
+    is_lossless = False
+    if src_fmd5 and dst_fmd5 and src_fmd5.exists() and dst_fmd5.exists():
+        is_lossless = filecmp.cmp(src_fmd5, dst_fmd5, shallow=False)
+        
+    if src_fmd5 and src_fmd5.exists(): src_fmd5.unlink()
+    if dst_fmd5 and dst_fmd5.exists(): dst_fmd5.unlink()
     
-    return files
+    return is_lossless
 
 def process_file_worker(input_file: Path, config: dict, manifest_data: dict) -> tuple[Path, bool]:
     output_file = input_file.with_suffix(config['output_ext'])
     
     if output_file.exists():
-        logger.info(f"Output file already exists, skipping: {output_file.name}")
-        return output_file, True
-        
-    # validate checksum
+        logger.info(f"Output file already exists, validating: {output_file.name}")
+        if verify_lossless(input_file, output_file):
+            logger.info(f"Existing file passed verification: {output_file.name}")
+            if config.get('delete_source') and input_file.exists():
+                input_file.unlink()
+                logger.info(f"Deleted source: {input_file.name}")
+            return output_file, True
+        else:
+            logger.warning(f"Existing file failed verification. Deleting and re-transcoding: {output_file.name}")
+            output_file.unlink()
+            
     if not verify_file_checksum(input_file, manifest_data):
         logger.error(f"Aborting transcode for {input_file.name} due to checksum failure.")
         return output_file, False
         
     # transcode
-    logger.info(f"Transcoding {input_file.name} to {output_file.name}")
+    logger.info(f"Transcoding {input_file} to {output_file}")
     success = transcode_single_file(input_file, output_file, config)
     
     if success:
-        logger.info(f"Transcode complete. Validating lossless integrity for {output_file.name}...")
-        
-        # framemd5 check
-        src_fmd5 = generate_framemd5(input_file)
-        dst_fmd5 = generate_framemd5(output_file)
-        
-        is_lossless = False
-        if src_fmd5 and dst_fmd5:
-            is_lossless = compare_framemd5(src_fmd5, dst_fmd5)
-            
-        if src_fmd5 and src_fmd5.exists(): src_fmd5.unlink()
-        if dst_fmd5 and dst_fmd5.exists(): dst_fmd5.unlink()
-        
-        if is_lossless:
+        if verify_lossless(input_file, output_file):
             logger.info(f"Lossless verification passed for: {output_file.name}")
-            if config.get('delete_source'):
+            if config.get('delete_source') and input_file.exists():
                 input_file.unlink()
                 logger.info(f"Deleted source: {input_file.name}")
         else:
-            logger.error(f"Lossless verification FAILED. Source streams do not match output for: {input_file.name}")
+            logger.error(f"Lossless verification FAILED. Streams do not match for: {input_file.name}")
             if output_file.exists():
                 output_file.unlink()
                 logger.info(f"Deleted failed transcoded output: {output_file.name}")
@@ -256,12 +226,34 @@ def run_transcoding(args: argparse.Namespace, type_filter: str = None) -> None:
     all_tasks = []
     for pkg in tqdm(valid_packages, desc="Scanning packages", unit="pkg", disable=len(valid_packages) < 5):
         manifest_data = parse_manifest(pkg)
+        
+        if getattr(args, 'all', False):
+            possible_folders = ['EditMasters', 'PreservationMasters']
+            target_folders = [
+                folder for folder in possible_folders 
+                if (pkg / folder).exists() or (pkg / 'data' / folder).exists()
+            ]
+            
+            if not target_folders:
+                logger.warning(f"EditMasters and PreservationMasters not found for {pkg.name}")
+                continue
+                
+        else:
+            edit_masters_path = pkg / 'data' / 'EditMasters'
+            if edit_masters_path.exists() and edit_masters_path.is_dir():
+                target_folders = ['EditMasters']
+            else:
+                target_folders = ['PreservationMasters']
+
         for t in active_types:
             config = TRANSCODERS[t]
-            files = find_files(pkg, config)
+            files = find_package_files(
+                pkg, 
+                folders=target_folders, 
+                valid_exts={config['input_ext']}
+            )
             for f in files:
                 all_tasks.append((f, config, manifest_data))
-        
     if not all_tasks:
         logger.info("No files found to transcode in any of the provided packages.")
         return
