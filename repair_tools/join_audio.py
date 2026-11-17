@@ -1,12 +1,12 @@
 # 0. targets part files matching r"p\d\d" in 'data/EditMasters' and 'data/ServiceCopies'; 'data/PreservationMasters' is left alone
 # 1. if wav/flac: part file is passed to soundfile import, which pulls file info, ie subtype, sample rate, channels, duration, size
 # 2. if mp4: ffprobe gets sample rate, channels, duration, size, and bits per raw sample (defaults to AAC)
-# ***** PCM_24 is default for outliers, retains all bits (saw bit loss in previous versions without forcing PCM type) 
+# ***** PCM_24 is default for outliers, retains all bits (saw bit loss in previous versions without forcing PCM type)
 # 3. audio is decoded into 32 bit float (keeping source sampling rate)
 # 3a. soundfile for wav/flac, ffmpeg for mp4 (lossy vs. not)
 # 4. audio floats are compared across max 30s window (slices raw channels before mono average to save RAM)
 # 4a. NCC: scipy.correlate uses correlation score to test every sample from p1 against p2
-# ---- r(t) = [(p1 wave height)*(p2 wave height)/(total energy or volume)] 
+# ---- r(t) = [(p1 wave height)*(p2 wave height)/(total energy or volume)]
 # ---- r(t) > 0.60 [min_corr], acoustic overlap of t samples, if near 0, files more closely cut
 # 4b. GCC-PHAT (FFT) used when there is too much background noise, can confuse NCC and throw off correlation
 # 4c. RMS gain ratio calculated across overlap to detect volume differences between parts
@@ -31,6 +31,7 @@
 # 12. --no-match-gain disables automatic RMS gain balancing
 
 import argparse
+import csv
 import datetime
 import logging
 import re
@@ -130,6 +131,17 @@ def parse_args():
         dest="match_gain",
         help="Disable automatic gain matching.",
     )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Detect overlaps/gain only; write no output files, audit logs, or JSON merges.",
+    )
+    parser.add_argument(
+        "--seam-report",
+        type=Path,
+        default=None,
+        help="Append one CSV row per seam (package, boundary, overlap, confidence, gain) to this path.",
+    )
     return parser.parse_args()
 
 def format_duration_human(total_seconds):
@@ -174,15 +186,18 @@ def get_file_metadata(file_path):
         str(path_obj),
     ]
     try:
-        res = subprocess.check_output(cmd).decode().strip().split(",")
+        res = subprocess.check_output(cmd, stderr=subprocess.PIPE).decode().strip().split(",")
         sr = int(res[0])
         ch = int(res[1])
         bits = res[2] if len(res) > 2 and res[2] != "N/A" and res[2] != "" else "16"
         subtype = "PCM_24" if bits == "24" else "AAC"
         dur = float(res[3]) if len(res) > 3 else 0.0
         return sr, ch, subtype, dur, file_size
-    except Exception:
-        return 44100, 2, "AAC", 0.0, file_size
+    except subprocess.CalledProcessError as e:
+        stderr_text = e.stderr.decode(errors="replace").strip() if e.stderr else ""
+        raise RuntimeError(f"ffprobe failed to read metadata for {path_obj.name}: {stderr_text or e}") from e
+    except Exception as e:
+        raise RuntimeError(f"Could not parse ffprobe output for {path_obj.name}: {e}") from e
 
 
 def audio_to_float(file_path, target_sr=None):
@@ -196,6 +211,11 @@ def audio_to_float(file_path, target_sr=None):
     # direct read for lossless formats (avoid bit loss)
     if ext in [".wav", ".flac"]:
         data, sr = sf.read(str(path_obj), dtype="float32")
+        if target_sr is not None and sr != target_sr:
+            raise RuntimeError(
+                f"Sample rate mismatch: {path_obj.name} is {sr} Hz, expected {target_sr} Hz "
+                "(to match the first part). Shouldn't join parts with mismatched sample rates."
+            )
         if data.ndim == 1:
             data = data[:, np.newaxis]
         return data, sr
@@ -263,7 +283,7 @@ def find_part_overlap(audio1, audio2, sr, max_search_sec=30.0, min_corr=0.60):
 # standard NCC with GCC-PHAT fallback.
     search_samples = int(max_search_sec * sr)
 
-    # slice raw channels first to avoid memory issues 
+    # slice raw channels first to avoid memory issues
     tail1_raw = audio1[-min(len(audio1), search_samples):]
     head2_raw = audio2[:min(len(audio2), search_samples)]
 
@@ -279,7 +299,7 @@ def find_part_overlap(audio1, audio2, sr, max_search_sec=30.0, min_corr=0.60):
     denom = np.linalg.norm(t1_norm) * np.linalg.norm(h2_norm)
     if denom == 0:
         return 0, 0.0, 1.0
-    
+
     # scipy.signal.correlate used == Convolution Theorem (Wiener-Khinchin theorem)
     # FFT of both signals: X(f) = F{x(t)} and Y(f) = F{y(t)}
     # mutliply freq sepctrum of one by the complex conjugate(?) of the other in the freq domain: S_xy(f) = X(F)*Y^*(f)
@@ -297,7 +317,8 @@ def find_part_overlap(audio1, audio2, sr, max_search_sec=30.0, min_corr=0.60):
     if len(valid_corr) > 0:
         best_idx = np.argmax(valid_corr)
         best_lag = valid_lags[best_idx]
-        cand_overlap = len(t1_norm) - best_lag
+        # make sure the expected overlap is not longer than the file
+        cand_overlap = min(len(t1_norm) - best_lag, len(head2))
 
         if cand_overlap > 0:
             sub_a = tail1[-cand_overlap:]
@@ -324,7 +345,8 @@ def find_part_overlap(audio1, audio2, sr, max_search_sec=30.0, min_corr=0.60):
         # valid positive overlap range corresponds to indices [1, len(t1_norm)]
         valid_phat = phat_corr[:len(t1_norm)]
         phat_lag = int(np.argmax(valid_phat))
-        phat_overlap = len(t1_norm) - phat_lag
+        # make sure the expected overlap is not longer than the file
+        phat_overlap = min(len(t1_norm) - phat_lag, len(head2))
 
         if phat_overlap > 0:
             sub_a = tail1[-phat_overlap:]
@@ -360,11 +382,11 @@ def stitch_parts(audio1, audio2, overlap_samples, sr, crossfade_sec=0.1, gain_ra
     if (not match_gain) or (abs(1.0 - gain_ratio) < 1e-4):
         g1, g2 = 1.0, 1.0
     elif gain_ratio > 1.0:
-        # p1 is louder; reduce p1 to match p2 
+        # p1 is louder; reduce p1 to match p2
         g1 = 1.0 / gain_ratio
         g2 = 1.0
     else:
-        # p2 is louder; reduce p2 to match p1 
+        # p2 is louder; reduce p2 to match p1
         g1 = 1.0
         g2 = gain_ratio
 
@@ -609,7 +631,7 @@ def get_file_location(path):
     if parent_name == "preservationmasters" or "_pm" in name_lower:
         return None
 
-    #double check for _em mp4 files in service copies folder 
+    #double check for _em mp4 files in service copies folder
     if parent_name == "servicecopies" or "_sc" in name_lower:
         return "sc"
 
@@ -658,6 +680,7 @@ def group_part_files(part_file_tuples):
 
     for out_path in groups:
         groups[out_path]["parts"].sort(key=lambda item: item[0])
+        groups[out_path]["part_numbers"] = [item[0] for item in groups[out_path]["parts"]]
         groups[out_path]["parts"] = [item[1] for item in groups[out_path]["parts"]]
 
     return groups
@@ -846,6 +869,24 @@ def generate_audit_table(
 
     return "\n".join(lines)
 
+
+SEAM_REPORT_FIELDS = [
+    "package", "output_file", "location", "boundary",
+    "overlap_samples", "overlap_sec", "confidence", "gain_db",
+]
+
+
+def append_seam_report_row(csv_path, row):
+    """Appends one seam's detection metrics as a CSV row, writing a header on first write."""
+    csv_path = Path(csv_path)
+    write_header = not csv_path.exists() or csv_path.stat().st_size == 0
+    with open(csv_path, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=SEAM_REPORT_FIELDS)
+        if write_header:
+            writer.writeheader()
+        writer.writerow(row)
+
+
 def process_bag(
     package_path,
     crossfade_sec=0.1,
@@ -853,13 +894,16 @@ def process_bag(
     include_service_copies=True,
     merge_json_enabled=False,
     match_gain=True,
+    dry_run=False,
+    seam_report_path=None,
 ):
     pkg_dir = Path(package_path)
     part_files = find_part_files(pkg_dir, include_service_copies=include_service_copies)
+    results = []
 
     if not part_files:
         logger.info(f"Skipping {pkg_dir.name}: No matching EditMasters or ServiceCopies parts found.")
-        return
+        return results
 
     grouped_sequences = group_part_files(part_files)
     logger.info(f"Package: {pkg_dir.name} | Sequences found to process: {len(grouped_sequences)}")
@@ -870,12 +914,25 @@ def process_bag(
         role_label = location.upper()
 
         # log file path: {pkg_title}_{location?}_joinaudiolog_{DDMMYYYY}.log
+        # (file itself is only created below, right before it's actually written to,
+        # so a --dry-run never touches the data directory)
         date_stamp = datetime.datetime.now().strftime("%d%m%Y")
         log_file_name = f"{pkg_dir.name}_{location}_joinaudiolog_{date_stamp}.log"
         log_file_path = output_file.parent / log_file_name
-        audit_logger = get_file_logger(log_file_path)
 
         logger.info(f"Processing sequence: {output_file.name} ({len(files)} parts) in location '{location}'")
+
+        part_numbers = seq_info["part_numbers"]
+        expected_numbers = list(range(part_numbers[0], part_numbers[0] + len(part_numbers)))
+        if part_numbers != expected_numbers:
+            missing = sorted(set(expected_numbers) - set(part_numbers))
+            missing_str = ", ".join(f"p{n:02d}" for n in missing)
+            logger.error(
+                f"Skipping sequence {output_file.name}: non-contiguous part numbers "
+                f"(found {['p%02d' % n for n in part_numbers]}, missing {missing_str}). "
+                "Skipping join until part number is resolved."
+            )
+            continue
 
         if output_file.exists():
             logger.warning(f"Joined file already exist: {output_file.name}. Skipping.")
@@ -921,6 +978,18 @@ def process_bag(
             else:
                 logger.info(f"  -> Join p{i+1:02d} -> p{i+2:02d}: Hard Cut (No overlap), Conf: {conf:.3f}")
 
+            if seam_report_path is not None:
+                append_seam_report_row(seam_report_path, {
+                    "package": pkg_dir.name,
+                    "output_file": output_file.name,
+                    "location": location,
+                    "boundary": f"p{i+1:02d}->p{i+2:02d}",
+                    "overlap_samples": overlap,
+                    "overlap_sec": f"{overlap / sr:.4f}",
+                    "confidence": f"{conf:.4f}",
+                    "gain_db": f"{gain_db:.3f}",
+                })
+
             new_audio = stitch_parts(
                 current_audio,
                 next_audio,
@@ -945,15 +1014,31 @@ def process_bag(
                 "gain_str": gain_str,
             })
 
+        if dry_run:
+            # detection only: no output written, nothing to validate or merge
+            del current_audio
+            logger.info(f"[DRY RUN] Detected {len(files) - 1} seam(s) for {output_file.name}; no output written.")
+            continue
+
         # 4. save output
         save_audio(output_file, current_audio, sr, subtype=native_subtype)
         logger.info(f"Successfully saved joined file: {output_file.name}")
-        
+
         # clear RAM again before validation
         del current_audio
 
         # 5. validation checks
         all_passed, val_summary = validate_stitched_output(files, output_file, overlaps_history, sr)
+
+        # quarantine failed joins with a rename
+        if not all_passed:
+            failed_path = output_file.with_name(f"{output_file.stem}_QCFAIL{output_file.suffix}")
+            try:
+                output_file.rename(failed_path)
+                logger.warning(f"Renamed failed join to {failed_path.name} for manual review.")
+                output_file = failed_path
+            except OSError as e:
+                logger.error(f"Could not rename failed output to flag it for review: {e}")
 
         # add seam metrics into audit data
         for i, (jump, status) in enumerate(val_summary["seam_metrics"]):
@@ -978,6 +1063,7 @@ def process_bag(
         }
 
         # 7. write table to logfile
+        audit_logger = get_file_logger(log_file_path)
         audit_table_text = generate_audit_table(
             pkg_title=pkg_dir.name,
             location=location,
@@ -993,7 +1079,9 @@ def process_bag(
         if all_passed:
             logger.info(f"[PASS] QC validated for {output_file.name}")
         else:
-            logger.warning(f"[FAIL] QC failed for {output_file.name}")
+            logger.warning(f"[FAIL] QC failed. Output flagged for review: {output_file.name}")
+
+        results.append({"file": output_file.name, "status": "PASS" if all_passed else "FAIL"})
 
         # 8. json merging
         if merge_json_enabled:
@@ -1005,6 +1093,9 @@ def process_bag(
                 else:
                     logger.info(f"Merging {len(part_jsons)} part JSON files -> {target_json.name}")
                     merge_jsons(part_jsons, joined_media_path=output_file, output_json_path=target_json)
+
+    return results
+
 
 def main():
     args = parse_args()
@@ -1051,17 +1142,36 @@ def main():
         return
 
     include_sc = not args.no_servicecopies
-    logger.info(f"Discovered {len(pkg_paths)} package(s). Service copy processing: {'ENABLED' if include_sc else 'DISABLED'}")
+    mode_label = "DRY RUN (detection only, no output written)" if args.dry_run else "LIVE"
+    logger.info(
+        f"Discovered {len(pkg_paths)} package(s). Service copy processing: "
+        f"{'ENABLED' if include_sc else 'DISABLED'}. Mode: {mode_label}"
+    )
+    if args.seam_report:
+        logger.info(f"Seam-level metrics will be appended to: {args.seam_report}")
 
+    all_results = []
     for pkg_path in pkg_paths:
-        process_bag(
+        all_results.extend(process_bag(
             package_path=pkg_path,
             crossfade_sec=args.crossfade,
             min_corr=args.min_corr,
             include_service_copies=include_sc,
             merge_json_enabled=args.merge_json,
             match_gain=args.match_gain,
-        )
+            dry_run=args.dry_run,
+            seam_report_path=args.seam_report,
+        ) or [])
+
+    if args.dry_run:
+        logger.info("[DRY RUN] Complete. No output files, audit logs, or JSON merges were written.")
+        return
+
+    failed = [r["file"] for r in all_results if r["status"] == "FAIL"]
+    passed_count = len(all_results) - len(failed)
+    logger.info(f"Run summary: {passed_count} passed, {len(failed)} failed out of {len(all_results)} sequence(s) joined.")
+    if failed:
+        logger.warning("Failed sequences (flagged with _QCFAIL, needs manual review): " + ", ".join(failed))
 
 
 if __name__ == "__main__":
