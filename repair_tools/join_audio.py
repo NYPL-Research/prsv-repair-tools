@@ -663,6 +663,7 @@ def group_part_files(part_file_tuples):
 
     for out_path in groups:
         groups[out_path]["parts"].sort(key=lambda item: item[0])
+        groups[out_path]["part_numbers"] = [item[0] for item in groups[out_path]["parts"]]
         groups[out_path]["parts"] = [item[1] for item in groups[out_path]["parts"]]
 
     return groups
@@ -881,6 +882,18 @@ def process_bag(
         audit_logger = get_file_logger(log_file_path)
 
         logger.info(f"Processing sequence: {output_file.name} ({len(files)} parts) in location '{location}'")
+
+        part_numbers = seq_info["part_numbers"]
+        expected_numbers = list(range(part_numbers[0], part_numbers[0] + len(part_numbers)))
+        if part_numbers != expected_numbers:
+            missing = sorted(set(expected_numbers) - set(part_numbers))
+            missing_str = ", ".join(f"p{n:02d}" for n in missing)
+            logger.error(
+                f"Skipping sequence {output_file.name}: non-contiguous part numbers "
+                f"(found {['p%02d' % n for n in part_numbers]}, missing {missing_str}). "
+                "Skipping join until part number is resolved."
+            )
+            continue
 
         if output_file.exists():
             logger.warning(f"Joined file already exist: {output_file.name}. Skipping.")
