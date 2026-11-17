@@ -862,10 +862,11 @@ def process_bag(
 ):
     pkg_dir = Path(package_path)
     part_files = find_part_files(pkg_dir, include_service_copies=include_service_copies)
+    results = []
 
     if not part_files:
         logger.info(f"Skipping {pkg_dir.name}: No matching EditMasters or ServiceCopies parts found.")
-        return
+        return results
 
     grouped_sequences = group_part_files(part_files)
     logger.info(f"Package: {pkg_dir.name} | Sequences found to process: {len(grouped_sequences)}")
@@ -973,6 +974,16 @@ def process_bag(
         # 5. validation checks
         all_passed, val_summary = validate_stitched_output(files, output_file, overlaps_history, sr)
 
+        # quarantine failed joins with a rename
+        if not all_passed:
+            failed_path = output_file.with_name(f"{output_file.stem}_QCFAIL{output_file.suffix}")
+            try:
+                output_file.rename(failed_path)
+                logger.warning(f"Renamed failed join to {failed_path.name} for manual review.")
+                output_file = failed_path
+            except OSError as e:
+                logger.error(f"Could not rename failed output to flag it for review: {e}")
+
         # add seam metrics into audit data
         for i, (jump, status) in enumerate(val_summary["seam_metrics"]):
             seam_data_list[i]["jump"] = f"{jump:.4f} ({'Pass' if jump <= 0.40 else 'Warn'})"
@@ -1011,7 +1022,9 @@ def process_bag(
         if all_passed:
             logger.info(f"[PASS] QC validated for {output_file.name}")
         else:
-            logger.warning(f"[FAIL] QC failed for {output_file.name}")
+            logger.warning(f"[FAIL] QC failed. Output flagged for review: {output_file.name}")
+
+        results.append({"file": output_file.name, "status": "PASS" if all_passed else "FAIL"})
 
         # 8. json merging
         if merge_json_enabled:
@@ -1023,6 +1036,9 @@ def process_bag(
                 else:
                     logger.info(f"Merging {len(part_jsons)} part JSON files -> {target_json.name}")
                     merge_jsons(part_jsons, joined_media_path=output_file, output_json_path=target_json)
+
+    return results
+
 
 def main():
     args = parse_args()
@@ -1071,15 +1087,22 @@ def main():
     include_sc = not args.no_servicecopies
     logger.info(f"Discovered {len(pkg_paths)} package(s). Service copy processing: {'ENABLED' if include_sc else 'DISABLED'}")
 
+    all_results = []
     for pkg_path in pkg_paths:
-        process_bag(
+        all_results.extend(process_bag(
             package_path=pkg_path,
             crossfade_sec=args.crossfade,
             min_corr=args.min_corr,
             include_service_copies=include_sc,
             merge_json_enabled=args.merge_json,
             match_gain=args.match_gain,
-        )
+        ) or [])
+
+    failed = [r["file"] for r in all_results if r["status"] == "FAIL"]
+    passed_count = len(all_results) - len(failed)
+    logger.info(f"Run summary: {passed_count} passed, {len(failed)} failed out of {len(all_results)} sequence(s) joined.")
+    if failed:
+        logger.warning("Failed sequences (flagged with _QCFAIL, needs manual review): " + ", ".join(failed))
 
 
 if __name__ == "__main__":
