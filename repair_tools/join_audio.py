@@ -31,6 +31,7 @@
 # 12. --no-match-gain disables automatic RMS gain balancing
 
 import argparse
+import csv
 import datetime
 import logging
 import re
@@ -129,6 +130,17 @@ def parse_args():
         action="store_false",
         dest="match_gain",
         help="Disable automatic gain matching.",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Detect overlaps/gain only; write no output files, audit logs, or JSON merges.",
+    )
+    parser.add_argument(
+        "--seam-report",
+        type=Path,
+        default=None,
+        help="Append one CSV row per seam (package, boundary, overlap, confidence, gain) to this path.",
     )
     return parser.parse_args()
 
@@ -857,6 +869,24 @@ def generate_audit_table(
 
     return "\n".join(lines)
 
+
+SEAM_REPORT_FIELDS = [
+    "package", "output_file", "location", "boundary",
+    "overlap_samples", "overlap_sec", "confidence", "gain_db",
+]
+
+
+def append_seam_report_row(csv_path, row):
+    """Appends one seam's detection metrics as a CSV row, writing a header on first write."""
+    csv_path = Path(csv_path)
+    write_header = not csv_path.exists() or csv_path.stat().st_size == 0
+    with open(csv_path, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=SEAM_REPORT_FIELDS)
+        if write_header:
+            writer.writeheader()
+        writer.writerow(row)
+
+
 def process_bag(
     package_path,
     crossfade_sec=0.1,
@@ -864,6 +894,8 @@ def process_bag(
     include_service_copies=True,
     merge_json_enabled=False,
     match_gain=True,
+    dry_run=False,
+    seam_report_path=None,
 ):
     pkg_dir = Path(package_path)
     part_files = find_part_files(pkg_dir, include_service_copies=include_service_copies)
@@ -882,10 +914,11 @@ def process_bag(
         role_label = location.upper()
 
         # log file path: {pkg_title}_{location?}_joinaudiolog_{DDMMYYYY}.log
+        # (file itself is only created below, right before it's actually written to,
+        # so a --dry-run never touches the data directory)
         date_stamp = datetime.datetime.now().strftime("%d%m%Y")
         log_file_name = f"{pkg_dir.name}_{location}_joinaudiolog_{date_stamp}.log"
         log_file_path = output_file.parent / log_file_name
-        audit_logger = get_file_logger(log_file_path)
 
         logger.info(f"Processing sequence: {output_file.name} ({len(files)} parts) in location '{location}'")
 
@@ -945,6 +978,18 @@ def process_bag(
             else:
                 logger.info(f"  -> Join p{i+1:02d} -> p{i+2:02d}: Hard Cut (No overlap), Conf: {conf:.3f}")
 
+            if seam_report_path is not None:
+                append_seam_report_row(seam_report_path, {
+                    "package": pkg_dir.name,
+                    "output_file": output_file.name,
+                    "location": location,
+                    "boundary": f"p{i+1:02d}->p{i+2:02d}",
+                    "overlap_samples": overlap,
+                    "overlap_sec": f"{overlap / sr:.4f}",
+                    "confidence": f"{conf:.4f}",
+                    "gain_db": f"{gain_db:.3f}",
+                })
+
             new_audio = stitch_parts(
                 current_audio,
                 next_audio,
@@ -968,6 +1013,12 @@ def process_bag(
                 "confidence": f"{conf:.3f}",
                 "gain_str": gain_str,
             })
+
+        if dry_run:
+            # detection only: no output written, nothing to validate or merge
+            del current_audio
+            logger.info(f"[DRY RUN] Detected {len(files) - 1} seam(s) for {output_file.name}; no output written.")
+            continue
 
         # 4. save output
         save_audio(output_file, current_audio, sr, subtype=native_subtype)
@@ -1012,6 +1063,7 @@ def process_bag(
         }
 
         # 7. write table to logfile
+        audit_logger = get_file_logger(log_file_path)
         audit_table_text = generate_audit_table(
             pkg_title=pkg_dir.name,
             location=location,
@@ -1090,7 +1142,13 @@ def main():
         return
 
     include_sc = not args.no_servicecopies
-    logger.info(f"Discovered {len(pkg_paths)} package(s). Service copy processing: {'ENABLED' if include_sc else 'DISABLED'}")
+    mode_label = "DRY RUN (detection only, no output written)" if args.dry_run else "LIVE"
+    logger.info(
+        f"Discovered {len(pkg_paths)} package(s). Service copy processing: "
+        f"{'ENABLED' if include_sc else 'DISABLED'}. Mode: {mode_label}"
+    )
+    if args.seam_report:
+        logger.info(f"Seam-level metrics will be appended to: {args.seam_report}")
 
     all_results = []
     for pkg_path in pkg_paths:
@@ -1101,7 +1159,13 @@ def main():
             include_service_copies=include_sc,
             merge_json_enabled=args.merge_json,
             match_gain=args.match_gain,
+            dry_run=args.dry_run,
+            seam_report_path=args.seam_report,
         ) or [])
+
+    if args.dry_run:
+        logger.info("[DRY RUN] Complete. No output files, audit logs, or JSON merges were written.")
+        return
 
     failed = [r["file"] for r in all_results if r["status"] == "FAIL"]
     passed_count = len(all_results) - len(failed)
