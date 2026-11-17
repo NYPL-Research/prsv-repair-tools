@@ -174,15 +174,18 @@ def get_file_metadata(file_path):
         str(path_obj),
     ]
     try:
-        res = subprocess.check_output(cmd).decode().strip().split(",")
+        res = subprocess.check_output(cmd, stderr=subprocess.PIPE).decode().strip().split(",")
         sr = int(res[0])
         ch = int(res[1])
         bits = res[2] if len(res) > 2 and res[2] != "N/A" and res[2] != "" else "16"
         subtype = "PCM_24" if bits == "24" else "AAC"
         dur = float(res[3]) if len(res) > 3 else 0.0
         return sr, ch, subtype, dur, file_size
-    except Exception:
-        return 44100, 2, "AAC", 0.0, file_size
+    except subprocess.CalledProcessError as e:
+        stderr_text = e.stderr.decode(errors="replace").strip() if e.stderr else ""
+        raise RuntimeError(f"ffprobe failed to read metadata for {path_obj.name}: {stderr_text or e}") from e
+    except Exception as e:
+        raise RuntimeError(f"Could not parse ffprobe output for {path_obj.name}: {e}") from e
 
 
 def audio_to_float(file_path, target_sr=None):
