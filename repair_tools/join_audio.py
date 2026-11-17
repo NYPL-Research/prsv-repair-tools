@@ -1,12 +1,12 @@
 # 0. targets part files matching r"p\d\d" in 'data/EditMasters' and 'data/ServiceCopies'; 'data/PreservationMasters' is left alone
 # 1. if wav/flac: part file is passed to soundfile import, which pulls file info, ie subtype, sample rate, channels, duration, size
 # 2. if mp4: ffprobe gets sample rate, channels, duration, size, and bits per raw sample (defaults to AAC)
-# ***** PCM_24 is default for outliers, retains all bits (saw bit loss in previous versions without forcing PCM type) 
+# ***** PCM_24 is default for outliers, retains all bits (saw bit loss in previous versions without forcing PCM type)
 # 3. audio is decoded into 32 bit float (keeping source sampling rate)
 # 3a. soundfile for wav/flac, ffmpeg for mp4 (lossy vs. not)
 # 4. audio floats are compared across max 30s window (slices raw channels before mono average to save RAM)
 # 4a. NCC: scipy.correlate uses correlation score to test every sample from p1 against p2
-# ---- r(t) = [(p1 wave height)*(p2 wave height)/(total energy or volume)] 
+# ---- r(t) = [(p1 wave height)*(p2 wave height)/(total energy or volume)]
 # ---- r(t) > 0.60 [min_corr], acoustic overlap of t samples, if near 0, files more closely cut
 # 4b. GCC-PHAT (FFT) used when there is too much background noise, can confuse NCC and throw off correlation
 # 4c. RMS gain ratio calculated across overlap to detect volume differences between parts
@@ -196,6 +196,11 @@ def audio_to_float(file_path, target_sr=None):
     # direct read for lossless formats (avoid bit loss)
     if ext in [".wav", ".flac"]:
         data, sr = sf.read(str(path_obj), dtype="float32")
+        if target_sr is not None and sr != target_sr:
+            raise RuntimeError(
+                f"Sample rate mismatch: {path_obj.name} is {sr} Hz, expected {target_sr} Hz "
+                "(to match the first part). Shouldn't join parts with mismatched sample rates."
+            )
         if data.ndim == 1:
             data = data[:, np.newaxis]
         return data, sr
@@ -263,7 +268,7 @@ def find_part_overlap(audio1, audio2, sr, max_search_sec=30.0, min_corr=0.60):
 # standard NCC with GCC-PHAT fallback.
     search_samples = int(max_search_sec * sr)
 
-    # slice raw channels first to avoid memory issues 
+    # slice raw channels first to avoid memory issues
     tail1_raw = audio1[-min(len(audio1), search_samples):]
     head2_raw = audio2[:min(len(audio2), search_samples)]
 
@@ -279,7 +284,7 @@ def find_part_overlap(audio1, audio2, sr, max_search_sec=30.0, min_corr=0.60):
     denom = np.linalg.norm(t1_norm) * np.linalg.norm(h2_norm)
     if denom == 0:
         return 0, 0.0, 1.0
-    
+
     # scipy.signal.correlate used == Convolution Theorem (Wiener-Khinchin theorem)
     # FFT of both signals: X(f) = F{x(t)} and Y(f) = F{y(t)}
     # mutliply freq sepctrum of one by the complex conjugate(?) of the other in the freq domain: S_xy(f) = X(F)*Y^*(f)
@@ -360,11 +365,11 @@ def stitch_parts(audio1, audio2, overlap_samples, sr, crossfade_sec=0.1, gain_ra
     if (not match_gain) or (abs(1.0 - gain_ratio) < 1e-4):
         g1, g2 = 1.0, 1.0
     elif gain_ratio > 1.0:
-        # p1 is louder; reduce p1 to match p2 
+        # p1 is louder; reduce p1 to match p2
         g1 = 1.0 / gain_ratio
         g2 = 1.0
     else:
-        # p2 is louder; reduce p2 to match p1 
+        # p2 is louder; reduce p2 to match p1
         g1 = 1.0
         g2 = gain_ratio
 
@@ -609,7 +614,7 @@ def get_file_location(path):
     if parent_name == "preservationmasters" or "_pm" in name_lower:
         return None
 
-    #double check for _em mp4 files in service copies folder 
+    #double check for _em mp4 files in service copies folder
     if parent_name == "servicecopies" or "_sc" in name_lower:
         return "sc"
 
@@ -948,7 +953,7 @@ def process_bag(
         # 4. save output
         save_audio(output_file, current_audio, sr, subtype=native_subtype)
         logger.info(f"Successfully saved joined file: {output_file.name}")
-        
+
         # clear RAM again before validation
         del current_audio
 
