@@ -305,7 +305,8 @@ def find_part_overlap(audio1, audio2, sr, max_search_sec=30.0, min_corr=0.60):
     if len(valid_corr) > 0:
         best_idx = np.argmax(valid_corr)
         best_lag = valid_lags[best_idx]
-        cand_overlap = len(t1_norm) - best_lag
+        # make sure the expected overlap is not longer than the file
+        cand_overlap = min(len(t1_norm) - best_lag, len(head2))
 
         if cand_overlap > 0:
             sub_a = tail1[-cand_overlap:]
@@ -332,7 +333,8 @@ def find_part_overlap(audio1, audio2, sr, max_search_sec=30.0, min_corr=0.60):
         # valid positive overlap range corresponds to indices [1, len(t1_norm)]
         valid_phat = phat_corr[:len(t1_norm)]
         phat_lag = int(np.argmax(valid_phat))
-        phat_overlap = len(t1_norm) - phat_lag
+        # make sure the expected overlap is not longer than the file
+        phat_overlap = min(len(t1_norm) - phat_lag, len(head2))
 
         if phat_overlap > 0:
             sub_a = tail1[-phat_overlap:]
